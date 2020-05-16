@@ -244,10 +244,6 @@ class Commit:
             1 for (j, d, t) in file_statuses if t and not j and not d
         )
 
-        without_javadoc_tag_files_count = sum(
-            1 for (j, d, t) in file_statuses if not t
-        )
-
         javadoc_tag_files_count = sum(
             1 for (j, d, t) in file_statuses if t
         )
@@ -258,7 +254,7 @@ class Commit:
         elif pure_javadoc_tag_files_count > 0:
             self.commit_type = CommitType.ONLY_JAVADOC_TAGS_IN_SOME_FILES
             _only_javadoc_in_some_files_commits += 1
-        elif without_javadoc_tag_files_count == len(file_statuses):
+        elif javadoc_tag_files_count == 0:
             self.commit_type = CommitType.WITHOUT_JAVADOC_TAGS
         else:
             self.commit_type = CommitType.JAVA_AND_JAVADOC_TAGS_EVERYWHERE
