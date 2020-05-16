@@ -37,7 +37,7 @@ _patch_plus_prefix = re.compile(r'^\+( |\t)')
 _patch_minus_prefix = re.compile(r'^\-( |\t)')
 _patch_plus_minus_prefix = re.compile(r'^(\+|\-)( |\t)')
 _patch_plus_minus_asterisk_prefix = re.compile(r'^(\+|\-)( |\t)*\*\s*$')
-_function_headers = re.compile(r'^\s*(@\w+)*\s*(\w|\s|<|>|\?|,)+\((\w|\s|,|\.|\[|\]|<|>|\?)*\)(\w|\s|,)*(\{|\;)')
+_function_headers = re.compile(r'^\s*(@\w+)*\s*(\w|\s|<|>|\?|,|\.)+\((\w|\s|,|\.|\[|\]|<|>|\?)*\)(\w|\s|,)*(\{|\;)')
 whitespaces = re.compile(r'(\s)+')
 
 _total_commits: int = 0
@@ -48,8 +48,14 @@ def only_whitespaces(deleted: str, added: str) -> bool:
     added_without_whitespaces = whitespaces.sub('', added)
     return deleted_without_whitspaces == added_without_whitespaces
 
+@dataclasses.dataclass()
+class Modification:
+    file_name: str
+    javadoc_modification: str
+    functionheader_modification: str
+
 # @numba.jit()
-def has_java_javadoc_changed(patch: str, linecontext: int = 3) -> Tuple[bool, bool, bool, str]:
+def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -> Tuple[bool, bool, bool, List[Modification]]:
     patchlines = patch.replace('\r', '').split('\n')
 
     has_javadoc_tag_changed = False
@@ -66,6 +72,10 @@ def has_java_javadoc_changed(patch: str, linecontext: int = 3) -> Tuple[bool, bo
 
     interesting_line_indices: List[bool] = [False] * len(patchlines)
 
+    modifications_in_file: List[Modification] = []
+    javadoc_mod = ''
+    functionheader_mod = ''
+
     going = False
     in_javadoc = False
     in_javadoc_tag_section = False
@@ -74,6 +84,7 @@ def has_java_javadoc_changed(patch: str, linecontext: int = 3) -> Tuple[bool, bo
     lookfor_code = False
     lookfor_endtag = False
     linecode_list = []
+    linedoc_list = []
     for l, ln in zip(patchlines, itertools.count()):
         in_javadoc_end = False
         tag_line = False
@@ -84,10 +95,18 @@ def has_java_javadoc_changed(patch: str, linecontext: int = 3) -> Tuple[bool, bo
             if match:
                 for i in range(ln - len(linecode_list) + 1, ln+1):
                     interesting_line_indices[i] = True
-                    lookfor_code = False
+                lookfor_code = False
+                functionheader_mod = '\n'.join(k for k in linecode_list)
+                javadoc_mod = '\n'.join(k for k in linedoc_list)
+                linecode_list = []
+                linedoc_list = []
+                modifications_in_file.append(Modification(file_name, javadoc_mod, functionheader_mod))
             elif len(linecode_list) > 9:
                 lookfor_code = False
+                javadoc_mod = '\n'.join(k for k in linedoc_list)
                 linecode_list = []
+                linedoc_list = []
+                modifications_in_file.append(Modification(file_name, javadoc_mod, ''))
         if l.startswith('@@'):
             going = True
         elif l.startswith('--'):
@@ -100,6 +119,7 @@ def has_java_javadoc_changed(patch: str, linecontext: int = 3) -> Tuple[bool, bo
             lookfor_code = False
             lookfor_endtag = False
             linecode_list = []
+            linedoc_list = []
         if going and in_javadoc and _javadoc_end_marker.match(l):
             in_javadoc = False
             in_javadoc_tag_section = False
@@ -115,6 +135,7 @@ def has_java_javadoc_changed(patch: str, linecontext: int = 3) -> Tuple[bool, bo
                 if in_javadoc_tag_section or in_javadoc_end and tag_line:
                     has_javadoc_tag_changed = True
                     interesting_line_indices[ln] = True
+                    linedoc_list.append(l)
                     #for zi in range(max(0, ln - linecontext), min(len(patchlines), ln + linecontext) + 1):
                     #    interesting_line_indices[zi] = True
                 if _patch_minus_prefix.match(l):
@@ -157,7 +178,7 @@ def has_java_javadoc_changed(patch: str, linecontext: int = 3) -> Tuple[bool, bo
         )
     else:
         brief = ""
-    return has_java_changed, has_javadoc_changed, has_javadoc_tag_changed, brief
+    return has_java_changed, has_javadoc_changed, has_javadoc_tag_changed, modifications_in_file
 
 @enum.unique
 class CommitType(enum.Enum):
@@ -176,7 +197,9 @@ class Commit:
     sha1: str
     files: List[Optional[str]] = None
     commit_type: CommitType = CommitType.UNKNOWN
-    file_statuses: List[Tuple[bool, bool, bool, str]] = None
+    #file_statuses: List[Tuple[bool, bool, bool, str] = None
+    file_statuses: List[Tuple[bool, bool, bool]] = None
+    modifications: List[Modification] = None
 
     @staticmethod
     def read_file_in_any_encoding(patch_filename: str, filename: str, comment: str = "") -> str:
@@ -199,6 +222,7 @@ class Commit:
         global _mixed_commits, _only_javadoc_in_some_files_commits, _pure_javadoc_commits
 
         file_statuses: List[Tuple[bool, bool, bool]] = []
+        modifications: List[Modification] = []
 
         for f in self.files:
             patchname = subprocess.check_output([
@@ -208,21 +232,24 @@ class Commit:
             ]).decode(sys.getdefaultencoding()).strip()
             try:
                 patch = self.read_file_in_any_encoding(patchname, f, f"Commit: {self.sha1}")
-                file_statuses.append(has_java_javadoc_changed(patch))
+                tuple_ = has_java_javadoc_changed(f, patch)
+                file_statuses.append((tuple_[0], tuple_[1], tuple_[2]))
+                if tuple_[2] and not tuple_[0] and not  tuple_[1]:
+                    modifications.extend(tuple_[3])
             except Exception as e:
                 logging.error("Skipping bad patch of commit %s in file %s due to %s" % (self.sha1, f, e))
-                file_statuses.append((False, False, False, ''))
+                file_statuses.append((False, False, False))
 
         pure_javadoc_tag_files_count = sum(
-            1 for (j, d, t, s) in file_statuses if t and not j and not d
+            1 for (j, d, t) in file_statuses if t and not j and not d
         )
 
         without_javadoc_tag_files_count = sum(
-            1 for (j, d, t, s) in file_statuses if not t
+            1 for (j, d, t) in file_statuses if not t
         )
 
         javadoc_tag_files_count = sum(
-            1 for (j, d, t, s) in file_statuses if t
+            1 for (j, d, t) in file_statuses if t
         )
 
         if pure_javadoc_tag_files_count == len(file_statuses):
@@ -238,6 +265,7 @@ class Commit:
             _mixed_commits += 1
 
         self.file_statuses = file_statuses
+        self.modifications = modifications
 
 
     def get_file_statuses_str(self) -> str:
@@ -246,6 +274,15 @@ class Commit:
             if len(s):
                 res.append("%s:\n%s\n" % (f, s))
         return "\n".join(res)
+
+    def get_csv_lines(self, url_prefix: str) -> List[List[str]]:
+        if not self.modifications:
+            return [[self.commit_type.value, url_prefix + self.sha1, '', '', '']]
+        csv_lines = []
+        csv_lines.append([self.commit_type.value, url_prefix + self.sha1, self.modifications[0].file_name, self.modifications[0].javadoc_modification, self.modifications[0].functionheader_modification])
+        for i in range(1, len(self.modifications)):
+            csv_lines.append(['', '', self.modifications[i].file_name, self.modifications[i].javadoc_modification, self.modifications[i].functionheader_modification])
+        return csv_lines
 
     def csv_line(self, url_prefix: str) -> List[str]:
         return [
@@ -346,7 +383,7 @@ def calc_stats(args: argparse.Namespace):
     commit_lines = []
     for c in commits:
         if c.commit_type in {CommitType.ONLY_JAVADOC_TAGS_EVERYWHERE, CommitType.ONLY_JAVADOC_TAGS_IN_SOME_FILES}:
-            commit_lines.append(c.csv_line(args.commit_prefix))
+            commit_lines.extend(c.get_csv_lines(args.commit_prefix))
 
     df = pd.DataFrame(commit_lines)
     with pd.ExcelWriter('__commits.xlsx', engine='openpyxl') as writer:
