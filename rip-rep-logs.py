@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import shutil
+import os
 from typing import List, Set, Tuple, Optional, Any
 import dataclasses
 import enum
@@ -20,25 +21,26 @@ import tempfile
 import argparse
 import csv
 import itertools
+import datetime
 
 # git log --name-status --all
 # git format-patch -1 --numbered-files --unified=100000 8aad90891ea4ab5762420c7424db7b01ec50c107 -- "bundles/org.eclipse.swt/Eclipse SWT PI/common_j2se/org/eclipse/swt/internal/Library.java"
 
 
 _commit_line = re.compile(r'^commit ([0-9a-f]{40})$')
+_date_line = re.compile(r'^Date:\s*([0-9\-]+T[0-9\:]+)')
 _src_line = re.compile(r'^M\t((.+)\.java)$')
 _javadoc_start_marker = re.compile(r'^((\+|\-)( |\t))?\s*/\*\*\s*')
-#_javadoc_end_marker = re.compile(r'^((\+|\-)( |\t))?\s*(\*)?\s*\*/\s*$')
 _javadoc_end_marker = re.compile(r'^.*(\*/|\*\s*\*/)\s*$')
 _javadoc_section_marker = re.compile(r'^((\+|\-)( |\t))?\s*(\*|/\*\*)?\s*@(param|return|exception|throw|throws)\s+')
-_annotation = re.compile(r'^((\+|\-)( |\t))?\s*@\w+\s*')
 
 _patch_plus_prefix = re.compile(r'^\+( |\t)')
 _patch_minus_prefix = re.compile(r'^\-( |\t)')
-_patch_plus_minus_prefix = re.compile(r'^(\+|\-)( |\t)')
+_patch_plus_minus_prefix = re.compile(r'^(\+|\-)( |\t)?')
 _patch_plus_minus_asterisk_prefix = re.compile(r'^(\+|\-)( |\t)*\*\s*$')
-_function_headers = re.compile(r'^\s*(@\w+)*\s*(\w|\s|<|>|\?|,|\.|(\/\*\w+\*\/))+\((\w|\s|,|\.|\[|\]|<|>|\?|(\/\*\w+\*\/))*\)(\w|\s|,)*(\{|\;)')
+_function_headers = re.compile(r'^\s*(@\w+)*\s*(\w|\s|\[|\]|<|>|\?|,|\.|(\/\*\w+\*\/))+\((\w|\s|,|\.|\[|\]|<|>|\?|(\/\*\w+\*\/))*\)(\w|\s|,)*(\{|\;)')
 whitespaces = re.compile(r'(\s)+')
+_empty_line = re.compile(r'^(\+|\-)?( |\t)*\s*$')
 
 _total_commits: int = 0
 _java_files_commits: int = 0
@@ -53,15 +55,45 @@ class Modification:
     file_name: str
     javadoc_modification: str
     functionheader_modification: str
+    functionheader_date: datetime
+    time_offset: datetime
+
+def escape(l: str):
+    new_l=l.replace('[', '\[')
+    new_l=new_l.replace(']', '\]')
+    new_l=new_l.replace('/', '\/')
+    new_l=new_l.replace('*', '\*')
+    return new_l
+
+def find_commit_before(file_name: str, pattern : str, lines_numbers: int, sha: str, before: datetime) -> datetime:
+    str_lines = '-L/' + escape(pattern)+'/,+' + str(lines_numbers) +':' + file_name
+    try:
+        git_cmd = [
+            'git', 'log', sha, '--date=iso-strict', str_lines
+            ]
+        log = subprocess.check_output(git_cmd).decode(sys.getdefaultencoding())
+        log = log.replace('\r', '')
+        loglines = log.split('\n')
+        cur_date = None
+        cur_realdatetime = None
+
+        for l in loglines:
+            cld = _date_line.match(l)
+            if cld:
+                cur_date = cld.group(1)
+                cur_realdatetime = datetime.datetime.strptime(cur_date, "%Y-%m-%dT%H:%M:%S")
+                if cur_realdatetime < before:
+                    return cur_realdatetime
+    except Exception as e:
+        logging.warning(str(e))
+        cur_realdatetime = None
+    return cur_realdatetime
 
 # @numba.jit()
-def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -> Tuple[bool, bool, bool, List[Modification]]:
+def has_java_javadoc_changed(file_name: str, patch: str, commit_date: datetime, sha: str, linecontext: int = 3) -> Tuple[bool, bool, bool, List[Modification]]:
     patchlines = patch.replace('\r', '').split('\n')
 
     has_javadoc_tag_changed = False
-    # has_javadoc_tag_diffplus = False
-    # has_javadoc_tag_diffminus = False
-
     has_javadoc_changed = False
     has_java_changed = False
 
@@ -70,7 +102,7 @@ def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -
     tag_lines_before = ''
     tag_lines_after = ''
 
-    interesting_line_indices: List[bool] = [False] * len(patchlines)
+    #interesting_line_indices: List[bool] = [False] * len(patchlines)
 
     modifications_in_file: List[Modification] = []
     javadoc_mod = ''
@@ -82,31 +114,40 @@ def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -
     in_javadoc_end = False
     tag_line = False
     lookfor_code = False
+    lookfor_first_codeline = False
     lookfor_endtag = False
     linecode_list = []
     linedoc_list = []
+    start_header = ''
     for l, ln in zip(patchlines, itertools.count()):
         in_javadoc_end = False
         tag_line = False
-        if lookfor_code:
+        if (lookfor_first_codeline and not _empty_line.match(l)) or lookfor_code:
+            if lookfor_first_codeline:
+                start_header = l.lstrip()
+                lookfor_first_codeline = False
+                lookfor_code = True
             linecode_list.append(l)  
             lines_ = "".join(linecode_list)
             match = _function_headers.search(lines_)
             if match:
-                for i in range(ln - len(linecode_list) + 1, ln+1):
-                    interesting_line_indices[i] = True
                 lookfor_code = False
+                lookfor_first_codeline = False
+                number_of_lines = len(linecode_list)
                 functionheader_mod = '\n'.join(k for k in linecode_list)
                 javadoc_mod = '\n'.join(k for k in linedoc_list)
                 linecode_list = []
                 linedoc_list = []
-                modifications_in_file.append(Modification(file_name, javadoc_mod, functionheader_mod))
+                commit_before = find_commit_before(file_name, start_header, number_of_lines, sha,  commit_date)
+                offset = commit_date-commit_before
+                modifications_in_file.append(Modification(file_name, javadoc_mod, functionheader_mod, commit_before, offset))
             elif len(linecode_list) > 9:
                 lookfor_code = False
+                lookfor_first_codeline = False
                 javadoc_mod = '\n'.join(k for k in linedoc_list)
                 linecode_list = []
                 linedoc_list = []
-                modifications_in_file.append(Modification(file_name, javadoc_mod, ''))
+                modifications_in_file.append(Modification(file_name, javadoc_mod, None, None, None))
         if l.startswith('@@'):
             going = True
         elif l.startswith('--'):
@@ -126,7 +167,7 @@ def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -
             in_javadoc_end = True
             if lookfor_endtag:
                 lookfor_endtag = False
-                lookfor_code = True
+                lookfor_first_codeline = True
                 linecode_list = []
         if going and _patch_plus_minus_prefix.match(l):
             if _patch_plus_minus_asterisk_prefix.match(l):
@@ -134,7 +175,7 @@ def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -
             if in_javadoc_tag_section or in_javadoc_end:
                 if in_javadoc_tag_section or in_javadoc_end and tag_line:
                     has_javadoc_tag_changed = True
-                    interesting_line_indices[ln] = True
+                    # interesting_line_indices[ln] = True
                     linedoc_list.append(l)
                     #for zi in range(max(0, ln - linecontext), min(len(patchlines), ln + linecontext) + 1):
                     #    interesting_line_indices[zi] = True
@@ -145,10 +186,8 @@ def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -
                 if in_javadoc_tag_section:
                     lookfor_endtag = True
                 elif tag_line:
-                    lookfor_code = True
+                    lookfor_first_codeline = True
                     linecode_list = []
-                # has_javadoc_tag_diffplus |= _patch_plus_prefix.match(l)
-                # has_javadoc_tag_diffminus |= _patch_minus_prefix.match(l)
             elif in_javadoc:
                 has_javadoc_changed = True
                 if _patch_minus_prefix.match(l):
@@ -157,6 +196,10 @@ def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -
                     javadoc_lines_after = javadoc_lines_after + l[2:]
             else:
                 has_java_changed = True
+                lookfor_code = False
+                lookfor_first_codeline = False
+                linecode_list = []
+                linedoc_list = []
         else:
             if in_javadoc_tag_section:
                 tag_lines_before = tag_lines_before + l[2:]
@@ -165,19 +208,18 @@ def has_java_javadoc_changed(file_name: str, patch: str, linecontext: int = 3) -
                 javadoc_lines_before = javadoc_lines_before + l[2:]
                 javadoc_lines_after = javadoc_lines_after + l[2:]
 
-        # if has_java_changed and has_javadoc_changed and has_javadoc_tag_changed:
-        #     return True, True, True
     if only_whitespaces(javadoc_lines_before, javadoc_lines_after):
         has_javadoc_changed = False
     if only_whitespaces(tag_lines_before, tag_lines_after):
         has_javadoc_tag_changed = False
         
-    if has_javadoc_tag_changed and not has_java_changed:
-        brief = '\n'.join(
-            l for l, n in zip(patchlines, interesting_line_indices) if n
-        )
-    else:
-        brief = ""
+    #if has_javadoc_tag_changed and not has_java_changed:
+    #    brief = '\n'.join(
+    #        l for l, n in zip(patchlines, interesting_line_indices) if n
+    #    )
+    #else:
+    #    brief = ""
+    
     return has_java_changed, has_javadoc_changed, has_javadoc_tag_changed, modifications_in_file
 
 @enum.unique
@@ -196,8 +238,8 @@ _pure_javadoc_commits: int = 0
 class Commit:
     sha1: str
     files: List[Optional[str]] = None
+    date: datetime = None
     commit_type: CommitType = CommitType.UNKNOWN
-    #file_statuses: List[Tuple[bool, bool, bool, str] = None
     file_statuses: List[Tuple[bool, bool, bool]] = None
     modifications: List[Modification] = None
 
@@ -232,7 +274,7 @@ class Commit:
             ]).decode(sys.getdefaultencoding()).strip()
             try:
                 patch = self.read_file_in_any_encoding(patchname, f, f"Commit: {self.sha1}")
-                tuple_ = has_java_javadoc_changed(f, patch)
+                tuple_ = has_java_javadoc_changed(f, patch, self.date, self.sha1)
                 file_statuses.append((tuple_[0], tuple_[1], tuple_[2]))
                 if tuple_[2] and not tuple_[0] and not  tuple_[1]:
                     modifications.extend(tuple_[3])
@@ -264,37 +306,81 @@ class Commit:
         self.modifications = modifications
 
 
-    def get_file_statuses_str(self) -> str:
-        res = []
-        for f, (j, d, t, s) in zip(self.files, self.file_statuses):
-            if len(s):
-                res.append("%s:\n%s\n" % (f, s))
-        return "\n".join(res)
+    # def get_file_statuses_str(self) -> str:
+    #     res = []
+    #     for f, (j, d, t, s) in zip(self.files, self.file_statuses):
+    #         if len(s):
+    #             res.append("%s:\n%s\n" % (f, s))
+    #     return "\n".join(res)
 
     def get_csv_lines(self, url_prefix: str) -> List[List[str]]:
         if not self.modifications:
-            return [[self.commit_type.value, url_prefix + self.sha1, '', '', '']]
+            return [[self.commit_type.value, url_prefix + self.sha1, self.date, '', '', '']]
         csv_lines = []
-        csv_lines.append([self.commit_type.value, url_prefix + self.sha1, self.modifications[0].file_name, self.modifications[0].javadoc_modification, self.modifications[0].functionheader_modification])
-        for i in range(1, len(self.modifications)):
-            csv_lines.append(['', '', self.modifications[i].file_name, self.modifications[i].javadoc_modification, self.modifications[i].functionheader_modification])
+        for i in range(0, len(self.modifications)):
+            csv_lines.append(self.csv_line(i, url_prefix))
         return csv_lines
 
-    def csv_line(self, url_prefix: str) -> List[str]:
-        return [
-            self.commit_type.value,
-            url_prefix + self.sha1,
-            self.get_file_statuses_str()
-        ]
+    def csv_line(self, i: int, url_prefix: str) -> List[str]:
+        if i < 1:
+            if self.modifications[0].time_offset is None:
+                return [
+                    self.commit_type.value, 
+                    url_prefix + self.sha1, 
+                    self.date, 
+                    self.modifications[0].file_name, 
+                    self.modifications[0].javadoc_modification, 
+                    self.modifications[0].functionheader_modification, 
+                    self.modifications[0].functionheader_date, 
+                    '', 
+                    ''
+                    ]
+            else:
+                return [
+                    self.commit_type.value, 
+                    url_prefix + self.sha1, 
+                    self.date, 
+                    self.modifications[0].file_name, 
+                    self.modifications[0].javadoc_modification, 
+                    self.modifications[0].functionheader_modification, 
+                    self.modifications[0].functionheader_date, 
+                    self.modifications[0].time_offset.days, 
+                    self.modifications[0].time_offset.seconds//3600+self.modifications[0].time_offset.days*24
+                    ]
+        else:
+            if self.modifications[i].time_offset is None:
+                return [
+                    '', 
+                    '', 
+                    '', 
+                    self.modifications[i].file_name, 
+                    self.modifications[i].javadoc_modification, 
+                    self.modifications[i].functionheader_modification, 
+                    self.modifications[i].functionheader_date, 
+                    '', 
+                    ''
+                    ]
+            else:
+                return [
+                    '', 
+                    '', 
+                    '', 
+                    self.modifications[i].file_name, 
+                    self.modifications[i].javadoc_modification, 
+                    self.modifications[i].functionheader_modification, 
+                    self.modifications[i].functionheader_date, 
+                    self.modifications[i].time_offset.days, 
+                    self.modifications[i].time_offset.seconds//3600+self.modifications[i].time_offset.days*24
+                    ]
 
 
 def get_commits(single_commit: Optional[str] = None) -> List[Commit]:
     global _total_commits
 
     git_cmd = [
-        'git', 'show', '--name-status', single_commit
+        'git', 'show', '--name-status', '--date=iso-strict', single_commit
     ] if single_commit else [
-        'git', 'log', '--name-status', '--all'
+        'git', 'log', '--name-status', '--date=iso-strict', '--all'
     ]
 
     log = subprocess.check_output(git_cmd).decode(sys.getdefaultencoding())
@@ -302,24 +388,29 @@ def get_commits(single_commit: Optional[str] = None) -> List[Commit]:
     loglines = log.split('\n')
     commits = []
     cur_commit = None
+    cur_date = None
     cur_files = []
 
     def release():
         global _java_files_commits
         if cur_commit and len(cur_files):
             _java_files_commits += 1
-            commits.append(Commit(cur_commit, cur_files.copy()))
+            cur_realdatetime = datetime.datetime.strptime(cur_date, "%Y-%m-%dT%H:%M:%S")
+            commits.append(Commit(cur_commit, cur_files.copy(), cur_realdatetime))
 
     print("Analyzing log...")
 
     for l in tqdm.tqdm(loglines):
         clm = _commit_line.match(l)
         clf = _src_line   .match(l)
+        cld = _date_line.match(l)
         if clm:
             _total_commits += 1
             release()
             cur_commit = clm.group(1)
             cur_files = []
+        elif cld:
+            cur_date = cld.group(1)
         elif clf:
             cur_files.append(clf.group(1))
     release()
@@ -402,7 +493,7 @@ if __name__ == '__main__':
 
     argparser = argparse.ArgumentParser()
     argparser.add_argument('-cp', '--commit-prefix', type=str, default="https://github.com/albertogoffi/toradocu/commit/")
-    argparser.add_argument('-cl', '--context-lines', type=int, default=3)
+    #argparser.add_argument('-cl', '--context-lines', type=int, default=3)
     argparser.add_argument('-oc', '--only-commit', type=str, required=False, help=\
         "For debug purposes. Only analyse given commit, e.g. 7051049221c9d3b99ff179f167fa09a6e02138ee")
     args = argparser.parse_args()
