@@ -335,18 +335,17 @@ class Commit:
                     '', 
                     ''
                     ]
-            else:
-                return [
-                    self.commit_type.value, 
-                    url_prefix + self.sha1, 
-                    self.date, 
-                    self.modifications[0].file_name, 
-                    self.modifications[0].javadoc_modification, 
-                    self.modifications[0].functionheader_modification, 
-                    self.modifications[0].functionheader_date, 
-                    self.modifications[0].time_offset.days, 
-                    self.modifications[0].time_offset.seconds//3600+self.modifications[0].time_offset.days*24
-                    ]
+            return [
+                self.commit_type.value, 
+                url_prefix + self.sha1, 
+                self.date, 
+                self.modifications[0].file_name, 
+                self.modifications[0].javadoc_modification, 
+                self.modifications[0].functionheader_modification, 
+                self.modifications[0].functionheader_date, 
+                self.modifications[0].time_offset.days, 
+                self.modifications[0].time_offset.seconds//3600+self.modifications[0].time_offset.days*24
+                ]
         else:
             if self.modifications[i].time_offset is None:
                 return [
@@ -360,18 +359,17 @@ class Commit:
                     '', 
                     ''
                     ]
-            else:
-                return [
-                    '', 
-                    '', 
-                    '', 
-                    self.modifications[i].file_name, 
-                    self.modifications[i].javadoc_modification, 
-                    self.modifications[i].functionheader_modification, 
-                    self.modifications[i].functionheader_date, 
-                    self.modifications[i].time_offset.days, 
-                    self.modifications[i].time_offset.seconds//3600+self.modifications[i].time_offset.days*24
-                    ]
+            return [
+                '', 
+                '', 
+                '', 
+                self.modifications[i].file_name, 
+                self.modifications[i].javadoc_modification, 
+                self.modifications[i].functionheader_modification, 
+                self.modifications[i].functionheader_date, 
+                self.modifications[i].time_offset.days, 
+                self.modifications[i].time_offset.seconds//3600+self.modifications[i].time_offset.days*24
+                ]
 
 
 def get_commits(single_commit: Optional[str] = None) -> List[Commit]:
