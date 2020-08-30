@@ -33,6 +33,7 @@ _src_line = re.compile(r'^M\t((.+)\.java)$')
 _javadoc_start_marker = re.compile(r'^((\+|\-)( |\t))?\s*/\*\*\s*')
 _javadoc_end_marker = re.compile(r'^.*(\*/|\*\s*\*/)\s*$')
 _javadoc_section_marker = re.compile(r'^((\+|\-)( |\t))?\s*(\*|/\*\*)?\s*@(param|return|exception|throw|throws)\s+')
+_javadoc_uninteresting_tags = re.compile(r'^((\+|\-)( |\t))?\s*(\*|/\*\*)?\s*@(author|deprecated|see|since|version|serial)\s+')
 
 _patch_plus_prefix = re.compile(r'^\+( |\t)')
 _patch_minus_prefix = re.compile(r'^\-( |\t)')
@@ -161,6 +162,8 @@ def has_java_javadoc_changed(file_name: str, patch: str, commit_date: datetime, 
             lookfor_endtag = False
             linecode_list = []
             linedoc_list = []
+        elif going and in_javadoc_tag_section and _javadoc_uninteresting_tags.match(l):
+            in_javadoc_tag_section = False
         if going and in_javadoc and _javadoc_end_marker.match(l):
             in_javadoc = False
             in_javadoc_tag_section = False
@@ -315,7 +318,7 @@ class Commit:
 
     def get_csv_lines(self, url_prefix: str) -> List[List[str]]:
         if not self.modifications:
-            return [[self.commit_type.value, url_prefix + self.sha1, self.date, '', '', '']]
+            return [[self.commit_type.value, url_prefix + self.sha1, self.date, '', '']]
         csv_lines = []
         for i in range(0, len(self.modifications)):
             csv_lines.append(self.csv_line(i, url_prefix))
@@ -331,8 +334,7 @@ class Commit:
                     self.modifications[0].file_name, 
                     self.modifications[0].javadoc_modification, 
                     self.modifications[0].functionheader_modification, 
-                    self.modifications[0].functionheader_date, 
-                    '', 
+                    self.modifications[0].functionheader_date,  
                     ''
                     ]
             return [
@@ -343,8 +345,7 @@ class Commit:
                 self.modifications[0].javadoc_modification, 
                 self.modifications[0].functionheader_modification, 
                 self.modifications[0].functionheader_date, 
-                self.modifications[0].time_offset.days, 
-                self.modifications[0].time_offset.seconds//3600+self.modifications[0].time_offset.days*24
+                self.modifications[0].time_offset.days
                 ]
         else:
             if self.modifications[i].time_offset is None:
@@ -356,7 +357,6 @@ class Commit:
                     self.modifications[i].javadoc_modification, 
                     self.modifications[i].functionheader_modification, 
                     self.modifications[i].functionheader_date, 
-                    '', 
                     ''
                     ]
             return [
@@ -367,8 +367,7 @@ class Commit:
                 self.modifications[i].javadoc_modification, 
                 self.modifications[i].functionheader_modification, 
                 self.modifications[i].functionheader_date, 
-                self.modifications[i].time_offset.days, 
-                self.modifications[i].time_offset.seconds//3600+self.modifications[i].time_offset.days*24
+                self.modifications[i].time_offset.days
                 ]
 
 
